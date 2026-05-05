@@ -134,6 +134,14 @@ def train_step(
     return torch.nn.functional.cross_entropy(shift_logits.float(), shift_labels)
 
 
+def _total_grad_l2_norm(model: nn.Module) -> float:
+    """Global L2 norm of all gradients; FSDP-safe (collective — call on every rank)."""
+    inf = float("inf")
+    if isinstance(model, FSDP):
+        return float(FSDP.clip_grad_norm_(model, max_norm=inf))
+    return float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=inf))
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Tier1-lite decoder toy pretrain (HSDP / multi-node).")
     p.add_argument("--steps", type=int, default=100)
@@ -147,7 +155,22 @@ def main(argv: list[str] | None = None) -> None:
         default="auto",
         help="auto: use TE if installed, else PyTorch (use torch on AMD/ROCm).",
     )
+    p.add_argument(
+        "--log-grad-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log global L2 grad norm with loss (FSDP: extra collective). Use --no-log-grad-norm to skip.",
+    )
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Log loss (and grad norm if enabled) every N steps; always logs the last step.",
+    )
     args = p.parse_args(argv)
+    if args.log_every <= 0:
+        p.error("--log-every must be >= 1")
 
     rank, world_size, local_rank, local_world_size = _setup_dist()
     device = torch.device("cuda", local_rank)
@@ -191,9 +214,17 @@ def main(argv: list[str] | None = None) -> None:
             loss = train_step(model, batch, cfg.vocab_size) / args.grad_accum
             loss.backward()
             loss_acc += float(loss.detach()) * args.grad_accum
+        log_this_step = (step % args.log_every == 0) or (step == args.steps - 1)
+        grad_norm = 0.0
+        if args.log_grad_norm and log_this_step:
+            # FSDP: collective — same condition on every rank.
+            grad_norm = _total_grad_l2_norm(model)
         opt.step()
-        if rank == 0 and (step % 10 == 0 or step == args.steps - 1):
-            logger.info("step %s loss=%.4f", step, loss_acc)
+        if rank == 0 and log_this_step:
+            if args.log_grad_norm:
+                logger.info("step %s loss=%.6f grad_norm=%.6e", step, loss_acc, grad_norm)
+            else:
+                logger.info("step %s loss=%.6f", step, loss_acc)
 
     if world_size > 1:
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
