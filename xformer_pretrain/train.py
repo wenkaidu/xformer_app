@@ -114,10 +114,12 @@ def _wrap_fsdp(
 def _synthetic_batch(
     micro_batch: int, seq_len: int, vocab_size: int, device: torch.device, seed: int
 ) -> torch.Tensor:
-    # Generator device must match the output tensor device for CUDA randint.
-    g = torch.Generator(device=device)
+    # Draw on CPU with a CPU Generator, then move: avoids ROCm/PyTorch builds where
+    # torch.Generator(device=cuda) still counts as CPU for randint(..., device=cuda).
+    g = torch.Generator(device="cpu")
     g.manual_seed(seed)
-    return torch.randint(0, vocab_size, (micro_batch, seq_len), device=device, generator=g)
+    x = torch.randint(0, vocab_size, (micro_batch, seq_len), generator=g)
+    return x.to(device)
 
 
 def train_step(
