@@ -5,10 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xformer-pretrain"
 version = "0.1.0"
-description = "Toy multinode multigpu Tier1-lite TE decoder pretrain (HSDP)"
+description = "Toy multinode multigpu Tier1-lite decoder pretrain (HSDP); TE optional"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.4",
+]
+
+[project.optional-dependencies]
+te = [
   "transformer-engine[pytorch]>=2.0",
 ]
 

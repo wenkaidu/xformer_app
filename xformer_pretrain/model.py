@@ -1,60 +1,43 @@
 from __future__ import annotations
 
-import torch
+from typing import Literal
+
 import torch.nn as nn
-from transformer_engine.pytorch import TransformerLayer
-from transformer_engine.pytorch.attention import RotaryPositionEmbedding
 
 from xformer_pretrain.config import Tier1LiteConfig
+from xformer_pretrain.model_native import Tier1LiteDecoder
+
+BackendName = Literal["auto", "torch", "te"]
+
+__all__ = ["Tier1LiteDecoder", "BackendName", "build_decoder", "resolve_backend"]
 
 
-class Tier1LiteDecoder(nn.Module):
-    """
-    Causal decoder: TE TransformerLayer × N with SwiGLU, GQA (GMQA), RoPE, QK-norm.
-    """
+def resolve_backend(name: BackendName) -> Literal["torch", "te"]:
+    if name == "torch":
+        return "torch"
+    if name == "te":
+        try:
+            import transformer_engine  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "Backend 'te' requested but transformer_engine is not installed. "
+                "On NVIDIA: pip install 'xformer-pretrain[te]'. On AMD/ROCm use --backend torch (default)."
+            ) from e
+        return "te"
+    # auto
+    try:
+        import transformer_engine  # noqa: F401
 
-    def __init__(self, cfg: Tier1LiteConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-        head_dim = cfg.hidden_size // cfg.num_attention_heads
-        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList(
-            [
-                TransformerLayer(
-                    hidden_size=cfg.hidden_size,
-                    ffn_hidden_size=cfg.ffn_hidden_size,
-                    num_attention_heads=cfg.num_attention_heads,
-                    num_gqa_groups=cfg.num_gqa_groups,
-                    layernorm_epsilon=cfg.rms_norm_eps,
-                    hidden_dropout=cfg.hidden_dropout,
-                    attention_dropout=cfg.attn_dropout,
-                    fuse_qkv_params=False,
-                    normalization="RMSNorm",
-                    activation="swiglu",
-                    attn_input_format="bshd",
-                    bias=False,
-                    use_qk_norm=True,
-                    layer_number=i + 1,
-                )
-                for i in range(cfg.num_layers)
-            ]
-        )
-        self.rope = RotaryPositionEmbedding(head_dim)
-        self.final_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        return "te"
+    except ImportError:
+        return "torch"
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # input_ids: [B, S] int64
-        b, s = input_ids.shape
-        h = self.tok_emb(input_ids)
-        rope_emb = self.rope(s)
-        attn_mask = None
-        for layer in self.layers:
-            h = layer(
-                h,
-                attention_mask=attn_mask,
-                self_attn_mask_type="causal",
-                rotary_pos_emb=rope_emb,
-            )
-        h = self.final_layernorm(h)
-        return self.lm_head(h)
+
+def build_decoder(cfg: Tier1LiteConfig, backend: BackendName = "auto") -> nn.Module:
+    """Return native Tier1LiteDecoder or TE-backed module with the same forward API."""
+    resolved = resolve_backend(backend)
+    if resolved == "te":
+        from xformer_pretrain.model_te import Tier1LiteDecoderTE
+
+        return Tier1LiteDecoderTE(cfg)
+    return Tier1LiteDecoder(cfg)

@@ -9,6 +9,7 @@ from functools import partial
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import (
     FullStateDictConfig,
@@ -20,7 +21,8 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 
 from xformer_pretrain.config import Tier1LiteConfig
-from xformer_pretrain.model import Tier1LiteDecoder
+from xformer_pretrain.model import build_decoder, resolve_backend
+from xformer_pretrain.model_native import Tier1LiteDecoderBlock
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +46,15 @@ def _init_logging(rank: int) -> None:
     )
 
 
+def _process_group_backend() -> str:
+    return os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl")
+
+
 def _setup_dist() -> tuple[int, int, int, int]:
     rank, world_size, local_rank, local_world_size = _dist_env()
     _init_logging(rank)
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend=_process_group_backend())
     torch.cuda.set_device(local_rank)
     return rank, world_size, local_rank, local_world_size
 
@@ -73,23 +79,23 @@ def _shard_mesh(world_size: int, local_world_size: int) -> tuple[ShardingStrateg
     return ShardingStrategy.HYBRID_SHARD, mesh
 
 
-def _wrap_fsdp(model: torch.nn.Module, strategy: ShardingStrategy, device_mesh: object | None) -> FSDP:
-    try:
-        import transformer_engine.pytorch as te
-    except ImportError as e:
-        raise RuntimeError(
-            "transformer_engine is required. Install with: pip install 'transformer-engine[pytorch]'"
-        ) from e
-
+def _wrap_fsdp(
+    model: nn.Module,
+    strategy: ShardingStrategy,
+    device_mesh: object | None,
+    wrap_leaf: type[nn.Module] | tuple[type[nn.Module], ...],
+) -> FSDP:
     mp = MixedPrecision(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.bfloat16,
         buffer_dtype=torch.bfloat16,
     )
-    auto_wrap = partial(
-        lambda_auto_wrap_policy,
-        lambda_fn=lambda m: isinstance(m, te.TransformerLayer),
-    )
+    if isinstance(wrap_leaf, tuple):
+        types = wrap_leaf
+        lambda_fn = lambda m: isinstance(m, types)
+    else:
+        lambda_fn = lambda m: isinstance(m, wrap_leaf)
+    auto_wrap = partial(lambda_auto_wrap_policy, lambda_fn=lambda_fn)
     kwargs: dict = dict(
         use_orig_params=False,
         sync_module_states=True,
@@ -114,7 +120,7 @@ def _synthetic_batch(
 
 
 def train_step(
-    model: torch.nn.Module,
+    model: nn.Module,
     input_ids: torch.Tensor,
     vocab_size: int,
 ) -> torch.Tensor:
@@ -126,12 +132,18 @@ def train_step(
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="Tier1-lite TE decoder toy pretrain (HSDP / multi-node).")
+    p = argparse.ArgumentParser(description="Tier1-lite decoder toy pretrain (HSDP / multi-node).")
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--micro-batch", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--backend",
+        choices=("auto", "torch", "te"),
+        default="auto",
+        help="auto: use TE if installed, else PyTorch (use torch on AMD/ROCm).",
+    )
     args = p.parse_args(argv)
 
     rank, world_size, local_rank, local_world_size = _setup_dist()
@@ -140,12 +152,22 @@ def main(argv: list[str] | None = None) -> None:
     torch.manual_seed(args.seed + rank)
     random.seed(args.seed + rank)
 
+    resolved = resolve_backend(args.backend)
+    if rank == 0:
+        logger.info("Decoder backend: %s (requested %s)", resolved, args.backend)
+
     cfg = Tier1LiteConfig()
-    model = Tier1LiteDecoder(cfg).to(device)
+    model = build_decoder(cfg, args.backend).to(device)
 
     strategy, mesh = _shard_mesh(world_size, local_world_size)
     if world_size > 1:
-        model = _wrap_fsdp(model, strategy, mesh)
+        if resolved == "te":
+            import transformer_engine.pytorch as te
+
+            wrap_leaf = te.TransformerLayer
+        else:
+            wrap_leaf = Tier1LiteDecoderBlock
+        model = _wrap_fsdp(model, strategy, mesh, wrap_leaf)
     else:
         model = model.to(torch.bfloat16)
 
@@ -175,8 +197,8 @@ def main(argv: list[str] | None = None) -> None:
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
             state = model.state_dict()
         if rank == 0:
-            torch.save(state, "tier1_lite_te_rank0.pt")
-            logger.info("Wrote tier1_lite_te_rank0.pt (rank-0 full state dict).")
+            torch.save(state, "tier1_lite_rank0.pt")
+            logger.info("Wrote tier1_lite_rank0.pt (rank-0 full state dict).")
 
     if world_size > 1:
         dist.destroy_process_group()
