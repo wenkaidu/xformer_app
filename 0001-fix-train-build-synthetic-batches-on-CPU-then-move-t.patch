@@ -1,0 +1,37 @@
+From 79e2443f81c585b659e1babaa1cb8d72a506c9d5 Mon Sep 17 00:00:00 2001
+From: Wenkai Du <wenkai.du@amd.com>
+Date: Tue, 5 May 2026 11:42:41 -0700
+Subject: [PATCH] fix(train): build synthetic batches on CPU then move to
+ device
+
+ROCm/PyTorch can treat Generator(device=cuda) as CPU for randint
+validation; CPU draw + .to(device) avoids the mismatch.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ xformer_pretrain/train.py | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/xformer_pretrain/train.py b/xformer_pretrain/train.py
+index 0702335..6313888 100644
+--- a/xformer_pretrain/train.py
++++ b/xformer_pretrain/train.py
+@@ -114,10 +114,12 @@ def _wrap_fsdp(
+ def _synthetic_batch(
+     micro_batch: int, seq_len: int, vocab_size: int, device: torch.device, seed: int
+ ) -> torch.Tensor:
+-    # Generator device must match the output tensor device for CUDA randint.
+-    g = torch.Generator(device=device)
++    # Draw on CPU with a CPU Generator, then move: avoids ROCm/PyTorch builds where
++    # torch.Generator(device=cuda) still counts as CPU for randint(..., device=cuda).
++    g = torch.Generator(device="cpu")
+     g.manual_seed(seed)
+-    return torch.randint(0, vocab_size, (micro_batch, seq_len), device=device, generator=g)
++    x = torch.randint(0, vocab_size, (micro_batch, seq_len), generator=g)
++    return x.to(device)
+ 
+ 
+ def train_step(
+-- 
+2.43.0
+
