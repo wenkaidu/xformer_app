@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
 import sys
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -19,6 +21,7 @@ from torch.distributed.fsdp import (
     StateDictType,
 )
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+from torch.profiler import ProfilerActivity, profile, schedule as profiler_schedule, tensorboard_trace_handler
 
 from xformer_pretrain.config import Tier1LiteConfig
 from xformer_pretrain.model import build_decoder, resolve_backend
@@ -168,9 +171,31 @@ def main(argv: list[str] | None = None) -> None:
         metavar="N",
         help="Log loss (and grad norm if enabled) every N steps; always logs the last step.",
     )
+    p.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable PyTorch profiler on all ranks for one step (see --profile-step).",
+    )
+    p.add_argument(
+        "--profile-step",
+        type=int,
+        default=50,
+        metavar="S",
+        help="Zero-indexed training step to record (schedule wait=S, active=1). Default 50.",
+    )
+    p.add_argument(
+        "--profile-dir",
+        type=str,
+        default="profiler_trace",
+        metavar="DIR",
+        help="Output directory (shared FS recommended for multi-node). TensorBoard + Chrome traces.",
+    )
     args = p.parse_args(argv)
     if args.log_every <= 0:
         p.error("--log-every must be >= 1")
+    if args.profile_step < 0:
+        p.error("--profile-step must be >= 0")
 
     rank, world_size, local_rank, local_world_size = _setup_dist()
     device = torch.device("cuda", local_rank)
@@ -204,27 +229,96 @@ def main(argv: list[str] | None = None) -> None:
 
     model.train()
     step_seed = args.seed + rank * 9973
-    for step in range(args.steps):
-        loss_acc = 0.0
-        opt.zero_grad(set_to_none=True)
-        for _ in range(args.grad_accum):
-            batch = _synthetic_batch(
-                args.micro_batch, cfg.max_seq_len, cfg.vocab_size, device, step_seed + step
+
+    prof = None
+    if args.profile:
+        if args.profile_step >= args.steps:
+            if rank == 0:
+                logger.warning(
+                    "--profile-step (%s) >= --steps (%s); profiler will never enter an active window.",
+                    args.profile_step,
+                    args.steps,
+                )
+        profile_dir = Path(args.profile_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        tb = tensorboard_trace_handler(
+            dir_name=str(profile_dir),
+            worker_name=f"rank{rank}",
+            use_gzip=True,
+        )
+        profile_step = args.profile_step
+
+        def on_trace_ready(p) -> None:
+            tb(p)
+            chrome_path = profile_dir / f"rank{rank}_step{profile_step}.json"
+            p.export_chrome_trace(str(chrome_path))
+
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=profiler_schedule(
+                wait=profile_step,
+                warmup=0,
+                active=1,
+                repeat=1,
+            ),
+            on_trace_ready=on_trace_ready,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        prof.start()
+        if rank == 0:
+            logger.info(
+                "Profiler enabled: active window covers training step index %s (0-based); "
+                "combined view: tensorboard --logdir=%s (install torch_tb_profiler + tensorboard). "
+                "Per-rank Chrome: %s/rank*_step%s.json",
+                profile_step,
+                profile_dir.resolve(),
+                profile_dir.resolve(),
+                profile_step,
             )
-            loss = train_step(model, batch, cfg.vocab_size) / args.grad_accum
-            loss.backward()
-            loss_acc += float(loss.detach()) * args.grad_accum
-        log_this_step = (step % args.log_every == 0) or (step == args.steps - 1)
-        grad_norm = 0.0
-        if args.log_grad_norm and log_this_step:
-            # FSDP: collective — same condition on every rank.
-            grad_norm = _total_grad_l2_norm(model)
-        opt.step()
-        if rank == 0 and log_this_step:
-            if args.log_grad_norm:
-                logger.info("step %s loss=%.6f grad_norm=%.6e", step, loss_acc, grad_norm)
-            else:
-                logger.info("step %s loss=%.6f", step, loss_acc)
+
+    try:
+        for step in range(args.steps):
+            loss_acc = 0.0
+            opt.zero_grad(set_to_none=True)
+            for _ in range(args.grad_accum):
+                batch = _synthetic_batch(
+                    args.micro_batch, cfg.max_seq_len, cfg.vocab_size, device, step_seed + step
+                )
+                loss = train_step(model, batch, cfg.vocab_size) / args.grad_accum
+                loss.backward()
+                loss_acc += float(loss.detach()) * args.grad_accum
+            log_this_step = (step % args.log_every == 0) or (step == args.steps - 1)
+            grad_norm = 0.0
+            if args.log_grad_norm and log_this_step:
+                # FSDP: collective — same condition on every rank.
+                grad_norm = _total_grad_l2_norm(model)
+            opt.step()
+            if rank == 0 and log_this_step:
+                if args.log_grad_norm:
+                    logger.info("step %s loss=%.6f grad_norm=%.6e", step, loss_acc, grad_norm)
+                else:
+                    logger.info("step %s loss=%.6f", step, loss_acc)
+            if prof is not None:
+                prof.step()
+    finally:
+        if prof is not None:
+            prof.stop()
+
+    if args.profile and world_size > 1:
+        dist.barrier()
+    if rank == 0 and args.profile and args.profile_step < args.steps:
+        manifest = {
+            "profile_step_zero_indexed": args.profile_step,
+            "world_size": world_size,
+            "tensorboard_cmd": f"tensorboard --logdir={Path(args.profile_dir).resolve()}",
+            "tensorboard_note": "Install torch_tb_profiler and open the PyTorch Profiler tab for a single combined timeline of all ranks.",
+            "chrome_traces_glob": str(Path(args.profile_dir) / f"rank*_step{args.profile_step}.json"),
+        }
+        with open(Path(args.profile_dir) / "profiler_manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        logger.info("Wrote profiler_manifest.json under %s", Path(args.profile_dir).resolve())
 
     if world_size > 1:
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
