@@ -248,10 +248,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         profile_step = args.profile_step
 
-        def on_trace_ready(p) -> None:
-            tb(p)
-            chrome_path = profile_dir / f"rank{rank}_step{profile_step}.json"
-            p.export_chrome_trace(str(chrome_path))
+        # Kineto can only serialize a trace once: tensorboard_trace_handler already
+        # persists it; do not also call export_chrome_trace on the same run.
+        on_trace_ready = tb
 
         prof = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -269,13 +268,12 @@ def main(argv: list[str] | None = None) -> None:
         prof.start()
         if rank == 0:
             logger.info(
-                "Profiler enabled: active window covers training step index %s (0-based); "
-                "combined view: tensorboard --logdir=%s (install torch_tb_profiler + tensorboard). "
-                "Per-rank Chrome: %s/rank*_step%s.json",
+                "Profiler enabled: active window covers training step index %s (0-based). "
+                "Combined multi-rank view: tensorboard --logdir=%s "
+                "(install torch_tb_profiler + tensorboard; PyTorch Profiler tab). "
+                "Traces are *.pt.trace.json.gz per rank under that directory.",
                 profile_step,
                 profile_dir.resolve(),
-                profile_dir.resolve(),
-                profile_step,
             )
 
     try:
@@ -314,7 +312,7 @@ def main(argv: list[str] | None = None) -> None:
             "world_size": world_size,
             "tensorboard_cmd": f"tensorboard --logdir={Path(args.profile_dir).resolve()}",
             "tensorboard_note": "Install torch_tb_profiler and open the PyTorch Profiler tab for a single combined timeline of all ranks.",
-            "chrome_traces_glob": str(Path(args.profile_dir) / f"rank*_step{args.profile_step}.json"),
+            "trace_files_glob": str(Path(args.profile_dir) / "*.pt.trace.json.gz"),
         }
         with open(Path(args.profile_dir) / "profiler_manifest.json", "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
