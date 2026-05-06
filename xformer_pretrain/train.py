@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -191,6 +192,18 @@ def main(argv: list[str] | None = None) -> None:
         metavar="DIR",
         help="Output directory (shared FS recommended for multi-node). TensorBoard + Chrome traces.",
     )
+    p.add_argument(
+        "--moe",
+        action="store_true",
+        help="Native backend: SwiGLU FFN replaced by top-1 routed MoE with variable all_to_all / all_to_all_single.",
+    )
+    p.add_argument(
+        "--moe-num-experts",
+        type=int,
+        default=16,
+        metavar="E",
+        help="Number of routed experts (logical); expert e maps to rank (e %% world_size).",
+    )
     args = p.parse_args(argv)
     if args.log_every <= 0:
         p.error("--log-every must be >= 1")
@@ -204,10 +217,20 @@ def main(argv: list[str] | None = None) -> None:
     random.seed(args.seed + rank)
 
     resolved = resolve_backend(args.backend)
+    if args.moe and resolved == "te":
+        p.error("--moe is implemented only on the native PyTorch decoder; use --backend torch.")
     if rank == 0:
         logger.info("Decoder backend: %s (requested %s)", resolved, args.backend)
 
     cfg = Tier1LiteConfig()
+    if args.moe:
+        cfg = dataclasses.replace(
+            cfg,
+            use_moe_style_ffn=True,
+            moe_num_experts=args.moe_num_experts,
+        )
+        if rank == 0:
+            logger.info("MoE-style FFN enabled (%s experts, map to ranks via %% world_size).", cfg.moe_num_experts)
     model = build_decoder(cfg, args.backend).to(device)
 
     strategy, mesh = _shard_mesh(world_size, local_world_size)

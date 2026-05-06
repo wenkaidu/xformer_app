@@ -15,6 +15,9 @@ class Tier1LiteConfig:
     rms_norm_eps: float = 1e-5
     attn_dropout: float = 0.0
     hidden_dropout: float = 0.0
+    # Variable-size MoE-style FFN (all_to_all + all_to_all_single); native backend only.
+    use_moe_style_ffn: bool = False
+    moe_num_experts: int = 16
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads != 0:
@@ -23,3 +26,5 @@ class Tier1LiteConfig:
             raise ValueError("num_gqa_groups must be in [1, num_attention_heads]")
         if self.num_attention_heads % self.num_gqa_groups != 0:
             raise ValueError("num_attention_heads must divide evenly by num_gqa_groups")
+        if self.moe_num_experts < 1:
+            raise ValueError("moe_num_experts must be >= 1")

@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from xformer_pretrain.config import Tier1LiteConfig
+from xformer_pretrain.moe_collectives import MoEStyleFFN
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -58,9 +59,16 @@ class Tier1LiteDecoderBlock(nn.Module):
 
         self.post_norm = nn.RMSNorm(d, eps=cfg.rms_norm_eps)
         ffn = cfg.ffn_hidden_size
-        self.gate = nn.Linear(d, ffn, bias=False)
-        self.up = nn.Linear(d, ffn, bias=False)
-        self.down = nn.Linear(ffn, d, bias=False)
+        if cfg.use_moe_style_ffn:
+            self.moe_ffn = MoEStyleFFN(d, ffn, cfg.moe_num_experts)
+            self.gate = None
+            self.up = None
+            self.down = None
+        else:
+            self.moe_ffn = None
+            self.gate = nn.Linear(d, ffn, bias=False)
+            self.up = nn.Linear(d, ffn, bias=False)
+            self.down = nn.Linear(ffn, d, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         cfg = self.cfg
@@ -93,8 +101,11 @@ class Tier1LiteDecoderBlock(nn.Module):
         x = x + h
 
         h = self.post_norm(x)
-        h = F.silu(self.gate(h)) * self.up(h)
-        h = self.down(h)
+        if self.cfg.use_moe_style_ffn:
+            h = self.moe_ffn(h)
+        else:
+            h = F.silu(self.gate(h)) * self.up(h)
+            h = self.down(h)
         return x + h
 
 
