@@ -173,6 +173,22 @@ def main(argv: list[str] | None = None) -> None:
         help="Log loss (and grad norm if enabled) every N steps; always logs the last step.",
     )
     p.add_argument(
+        "--checksum-collectives",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "CRC32 each collective input and output buffer on every rank. "
+            "Logs pg, seq, collective, and data size to --checksum-dir and stdout."
+        ),
+    )
+    p.add_argument(
+        "--checksum-dir",
+        type=str,
+        default="collective_checksums",
+        metavar="DIR",
+        help="Per-rank collective checksum logs (rank<N>.log). Used with --checksum-collectives.",
+    )
+    p.add_argument(
         "--profile",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -211,6 +227,12 @@ def main(argv: list[str] | None = None) -> None:
         p.error("--profile-step must be >= 0")
 
     rank, world_size, local_rank, local_world_size = _setup_dist()
+    if args.checksum_collectives:
+        from xformer_pretrain.collective_checksum import install_collective_checksum_hooks
+
+        checksum_log = install_collective_checksum_hooks(log_dir=args.checksum_dir)
+        if rank == 0:
+            logger.info("Collective checksum hooks installed. Per-rank logs under %s", checksum_log.parent.resolve())
     device = torch.device("cuda", local_rank)
 
     torch.manual_seed(args.seed + rank)
