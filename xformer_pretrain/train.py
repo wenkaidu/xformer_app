@@ -189,6 +189,15 @@ def main(argv: list[str] | None = None) -> None:
         help="Per-rank collective checksum logs (rank<N>.log). Used with --checksum-collectives.",
     )
     p.add_argument(
+        "--invariant-all-reduce",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Accumulate bf16/fp16 all-reduces in fp32 so the result does not depend "
+            "on reduction order. Doubles all-reduce bytes on the wire."
+        ),
+    )
+    p.add_argument(
         "--profile",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -233,6 +242,13 @@ def main(argv: list[str] | None = None) -> None:
         checksum_log = install_collective_checksum_hooks(log_dir=args.checksum_dir)
         if rank == 0:
             logger.info("Collective checksum hooks installed. Per-rank logs under %s", checksum_log.parent.resolve())
+    if args.invariant_all_reduce:
+        # After the checksum hook so the logged buffers are the fp32 ones.
+        from xformer_pretrain.invariant_collectives import install_position_invariant_all_reduce
+
+        install_position_invariant_all_reduce()
+        if rank == 0:
+            logger.info("Position-invariant all-reduce enabled (bf16/fp16 accumulated in fp32).")
     device = torch.device("cuda", local_rank)
 
     torch.manual_seed(args.seed + rank)
