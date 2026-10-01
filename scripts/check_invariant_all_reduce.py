@@ -17,7 +17,10 @@ import zlib
 import torch
 import torch.distributed as dist
 
-from xformer_pretrain.invariant_collectives import position_invariant_all_reduce
+from xformer_pretrain.invariant_collectives import (
+    position_invariant_all_reduce,
+    position_invariant_reduce_scatter_tensor,
+)
 
 # Per-rank magnitudes for the "wide" case: contributions span 1e-3 down to 1e-9,
 # far more than the ~2**14 range where the fp32 sum of 8 bf16 values stays exact.
@@ -47,6 +50,7 @@ def main() -> None:
     dist.init_process_group(backend="nccl")
     device = torch.device("cuda", local_rank)
 
+    world = dist.get_world_size()
     for case in args.cases:
         src = _contribution(case, args.numel, rank, device)
 
@@ -56,8 +60,24 @@ def main() -> None:
         invariant = src.clone()
         position_invariant_all_reduce(invariant)
 
+        # Reduce-scatter leaves each rank holding a different shard, so compare
+        # the gathered shards to see the whole result.
+        shard = torch.empty(args.numel // world, dtype=torch.bfloat16, device=device)
+        dist.reduce_scatter_tensor(shard, src.clone())
+        native_rs = torch.empty_like(src)
+        dist.all_gather_into_tensor(native_rs, shard)
+
+        position_invariant_reduce_scatter_tensor(shard, src.clone())
+        inv_rs = torch.empty_like(src)
+        dist.all_gather_into_tensor(inv_rs, shard)
+
         if rank == 0:
-            print(f"RESULT case={case} native_bf16={_crc(native):08x} invariant={_crc(invariant):08x}", flush=True)
+            print(
+                f"RESULT case={case}"
+                f" ar_native={_crc(native):08x} ar_invariant={_crc(invariant):08x}"
+                f" rs_native={_crc(native_rs):08x} rs_invariant={_crc(inv_rs):08x}",
+                flush=True,
+            )
 
     dist.destroy_process_group()
 
